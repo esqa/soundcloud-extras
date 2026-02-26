@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SoundCloud Extras
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.2
 // @description  Right-click to save artwork or download tracks from SoundCloud
 // @author       esqa
 // @match        https://soundcloud.com/*
@@ -23,6 +23,9 @@
     let targetImage = null;
     let imageType = 'artwork'; // 'artwork' or 'avatar'
     let targetElement = null; // Store the element that was clicked
+
+    // ── Batch download cancellation ──
+    let batchCancelled = false;
 
     // ── Intercepted credentials ──
     let interceptedClientId = null;
@@ -132,6 +135,7 @@
         document.body.appendChild(container);
 
         return {
+            el: container,
             setText(msg) { text.textContent = msg; },
             setProgress(pct) { progressFill.style.width = Math.min(100, Math.max(0, pct)) + '%'; },
             remove() { container.remove(); }
@@ -331,22 +335,111 @@
             offset += buf.length;
         }
 
-        // Step 7: Trigger download
+        // Step 7: Return blob and filename for caller to handle
         const blob = new Blob([merged], {
             type: ext === '.m4a' ? 'audio/mp4' : 'audio/mpeg'
         });
+        return { blob, filename: filename + ext };
+    }
+
+    // ── Build a ZIP file from an array of { name, data (ArrayBuffer) } ──
+    function buildZip(files) {
+        const crcTable = new Uint32Array(256);
+        for (let i = 0; i < 256; i++) {
+            let c = i;
+            for (let j = 0; j < 8; j++) {
+                c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+            }
+            crcTable[i] = c;
+        }
+
+        function crc32(data) {
+            const bytes = new Uint8Array(data);
+            let crc = 0xFFFFFFFF;
+            for (let i = 0; i < bytes.length; i++) {
+                crc = crcTable[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+            }
+            return (crc ^ 0xFFFFFFFF) >>> 0;
+        }
+
+        const encoder = new TextEncoder();
+        const entries = [];
+        let offset = 0;
+
+        for (const file of files) {
+            const nameBytes = encoder.encode(file.name);
+            const fileData = new Uint8Array(file.data);
+            const crc = crc32(fileData);
+
+            // Local file header
+            const local = new ArrayBuffer(30 + nameBytes.length);
+            const lv = new DataView(local);
+            lv.setUint32(0, 0x04034b50, true);
+            lv.setUint16(4, 20, true);
+            lv.setUint16(8, 0, true); // STORE
+            lv.setUint32(14, crc, true);
+            lv.setUint32(18, fileData.length, true);
+            lv.setUint32(22, fileData.length, true);
+            lv.setUint16(26, nameBytes.length, true);
+            new Uint8Array(local).set(nameBytes, 30);
+
+            // Central directory header
+            const central = new ArrayBuffer(46 + nameBytes.length);
+            const cv = new DataView(central);
+            cv.setUint32(0, 0x02014b50, true);
+            cv.setUint16(4, 20, true);
+            cv.setUint16(6, 20, true);
+            cv.setUint16(10, 0, true); // STORE
+            cv.setUint32(16, crc, true);
+            cv.setUint32(20, fileData.length, true);
+            cv.setUint32(24, fileData.length, true);
+            cv.setUint16(28, nameBytes.length, true);
+            cv.setUint32(42, offset, true);
+            new Uint8Array(central).set(nameBytes, 46);
+
+            entries.push({ local, data: fileData, central });
+            offset += 30 + nameBytes.length + fileData.length;
+        }
+
+        const centralDirOffset = offset;
+        let centralDirSize = 0;
+        for (const e of entries) centralDirSize += e.central.byteLength;
+
+        const eocd = new ArrayBuffer(22);
+        const ev = new DataView(eocd);
+        ev.setUint32(0, 0x06054b50, true);
+        ev.setUint16(8, files.length, true);
+        ev.setUint16(10, files.length, true);
+        ev.setUint32(12, centralDirSize, true);
+        ev.setUint32(16, centralDirOffset, true);
+
+        const result = new Uint8Array(offset + centralDirSize + 22);
+        let pos = 0;
+        for (const e of entries) {
+            result.set(new Uint8Array(e.local), pos);
+            pos += e.local.byteLength;
+            result.set(e.data, pos);
+            pos += e.data.length;
+        }
+        for (const e of entries) {
+            result.set(new Uint8Array(e.central), pos);
+            pos += e.central.byteLength;
+        }
+        result.set(new Uint8Array(eocd), pos);
+
+        return new Blob([result], { type: 'application/zip' });
+    }
+
+    // ── Trigger a blob download via <a> click ──
+    function triggerBlobDownload(blob, filename) {
         const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = blobUrl;
-        a.download = filename + ext;
+        a.download = filename;
         document.body.appendChild(a);
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
-
-        notification.setText('Download complete!');
-        notification.setProgress(100);
-        setTimeout(() => notification.remove(), 2500);
     }
 
     // ── Create custom context menu ──
@@ -513,6 +606,75 @@
         return trackUrl;
     }
 
+    // ── Download a single track from already-resolved track data ──
+    async function downloadTrackData(trackData, clientId, notification) {
+        const media = trackData.media || trackData.track?.media;
+        const trackAuth = trackData.track_authorization || trackData.track?.track_authorization || null;
+        const title = trackData.title || 'Unknown';
+        const artist = trackData.user?.username || '';
+        const baseName = cleanFilename(artist ? `${artist} - ${title}` : title);
+
+        if (!media?.transcodings || media.transcodings.length === 0) {
+            throw new Error('No media transcodings found');
+        }
+
+        console.log('[SC Extras] Available transcodings:', media.transcodings.map(t =>
+            `${t.format.protocol}/${t.format.mime_type} — ${t.preset} — ${t.quality}`
+        ));
+
+        const headers = buildHeaders();
+
+        // Priority order:
+        const progressive = media.transcodings.find(t =>
+            t.format.protocol === 'progressive' && t.format.mime_type === 'audio/mpeg'
+        );
+        const hlsAac160 = media.transcodings.find(t =>
+            t.format.protocol === 'hls' &&
+            (t.format.mime_type === 'audio/mp4' || t.format.mime_type.includes('mp4')) &&
+            (t.preset?.includes('aac_160') || t.quality === 'hq')
+        );
+        const hlsAacAny = media.transcodings.find(t =>
+            t.format.protocol === 'hls' &&
+            (t.format.mime_type === 'audio/mp4' || t.format.mime_type.includes('mp4'))
+        );
+        const hlsMp3 = media.transcodings.find(t =>
+            t.format.protocol === 'hls' && t.format.mime_type === 'audio/mpeg'
+        );
+
+        if (progressive?.url) {
+            notification.setText('Fetching stream URL...');
+            let streamUrl = progressive.url + `?client_id=${clientId}`;
+            if (trackAuth) streamUrl += `&track_authorization=${trackAuth}`;
+
+            const streamResp = await gmFetch(streamUrl, { headers });
+            const streamData = JSON.parse(streamResp.responseText);
+            if (!streamData.url) throw new Error('Progressive stream URL not found');
+
+            notification.setText('Downloading MP3...');
+            notification.setProgress(50);
+
+            const mp3Resp = await gmFetch(streamData.url, { responseType: 'arraybuffer' });
+            const blob = new Blob([mp3Resp.response], { type: 'audio/mpeg' });
+
+            notification.setText('Download complete!');
+            notification.setProgress(100);
+
+            return { blob, filename: baseName + '.mp3' };
+
+        } else if (hlsAac160?.url) {
+            return await downloadHLS(hlsAac160.url, clientId, trackAuth, baseName, '.m4a', notification);
+
+        } else if (hlsAacAny?.url) {
+            return await downloadHLS(hlsAacAny.url, clientId, trackAuth, baseName, '.m4a', notification);
+
+        } else if (hlsMp3?.url) {
+            return await downloadHLS(hlsMp3.url, clientId, trackAuth, baseName, '.mp3', notification);
+
+        } else {
+            throw new Error('No supported stream format found');
+        }
+    }
+
     // ── Main download function (async/await) ──
     async function downloadSong() {
         const { trackTitle, artistName } = getTrackInfo();
@@ -535,7 +697,6 @@
         const notification = createNotification('Fetching track data...');
 
         try {
-            // Get credentials
             let clientId = await getClientId();
             if (!clientId) {
                 notification.remove();
@@ -544,9 +705,7 @@
             }
 
             const headers = buildHeaders();
-            const baseName = cleanFilename(artistName ? `${artistName} - ${trackTitle}` : trackTitle);
 
-            // Resolve track
             let resolveUrl = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(trackUrl)}&client_id=${clientId}`;
             let trackData;
 
@@ -554,7 +713,6 @@
                 const resp = await gmFetch(resolveUrl, { headers });
                 trackData = JSON.parse(resp.responseText);
             } catch (err) {
-                // On 401/403, invalidate cached client_id and retry once
                 if (err?.status === 401 || err?.status === 403) {
                     notification.setText('Auth failed, retrying...');
                     interceptedClientId = null;
@@ -574,88 +732,293 @@
 
             if (!trackData) throw new Error('Track data not found');
 
-            const media = trackData.media || trackData.track?.media;
-            const trackAuth = trackData.track_authorization || trackData.track?.track_authorization || null;
-
-            if (!media?.transcodings || media.transcodings.length === 0) {
-                throw new Error('No media transcodings found');
-            }
-
-            // Log available transcodings for debugging
-            console.log('[SC Extras] Available transcodings:', media.transcodings.map(t =>
-                `${t.format.protocol}/${t.format.mime_type} — ${t.preset} — ${t.quality}`
-            ));
-
-            // Priority order:
-            // 1. Progressive MP3 (if still exists)
-            const progressive = media.transcodings.find(t =>
-                t.format.protocol === 'progressive' && t.format.mime_type === 'audio/mpeg'
-            );
-
-            // 2. HLS AAC high quality (160kbps — preset "aac_160k" or mime "audio/mp4")
-            const hlsAac160 = media.transcodings.find(t =>
-                t.format.protocol === 'hls' &&
-                (t.format.mime_type === 'audio/mp4' || t.format.mime_type.includes('mp4')) &&
-                (t.preset?.includes('aac_160') || t.quality === 'hq')
-            );
-
-            // 3. HLS AAC any quality
-            const hlsAacAny = media.transcodings.find(t =>
-                t.format.protocol === 'hls' &&
-                (t.format.mime_type === 'audio/mp4' || t.format.mime_type.includes('mp4'))
-            );
-
-            // 4. HLS MP3 (legacy)
-            const hlsMp3 = media.transcodings.find(t =>
-                t.format.protocol === 'hls' && t.format.mime_type === 'audio/mpeg'
-            );
-
-            if (progressive?.url) {
-                // Progressive direct download
-                notification.setText('Fetching stream URL...');
-                let streamUrl = progressive.url + `?client_id=${clientId}`;
-                if (trackAuth) streamUrl += `&track_authorization=${trackAuth}`;
-
-                const streamResp = await gmFetch(streamUrl, { headers });
-                const streamData = JSON.parse(streamResp.responseText);
-                if (!streamData.url) throw new Error('Progressive stream URL not found');
-
-                notification.setText('Downloading MP3...');
-                notification.setProgress(50);
-
-                GM_download({
-                    url: streamData.url,
-                    name: baseName + '.mp3',
-                    onload: function() {
-                        notification.setText('Download complete!');
-                        notification.setProgress(100);
-                        setTimeout(() => notification.remove(), 2500);
-                    },
-                    onerror: function(error) {
-                        console.error('Download failed:', error);
-                        notification.remove();
-                        alert('Failed to download track.');
-                    }
-                });
-
-            } else if (hlsAac160?.url) {
-                await downloadHLS(hlsAac160.url, clientId, trackAuth, baseName, '.m4a', notification);
-
-            } else if (hlsAacAny?.url) {
-                await downloadHLS(hlsAacAny.url, clientId, trackAuth, baseName, '.m4a', notification);
-
-            } else if (hlsMp3?.url) {
-                await downloadHLS(hlsMp3.url, clientId, trackAuth, baseName, '.mp3', notification);
-
-            } else {
-                throw new Error('No supported stream format found');
-            }
+            const { blob, filename } = await downloadTrackData(trackData, clientId, notification);
+            triggerBlobDownload(blob, filename);
+            notification.setText('Download complete!');
+            notification.setProgress(100);
+            setTimeout(() => notification.remove(), 2500);
 
         } catch (error) {
             console.error('[SC Extras] Download error:', error);
             notification.setText('Download failed');
             setTimeout(() => notification.remove(), 3000);
             alert('Failed to download: ' + (error.message || 'Unknown error'));
+        }
+    }
+
+    // ── Batch download: create notification with cancel link ──
+    function createBatchNotification(message) {
+        const notification = createNotification(message);
+        const textDiv = notification.el.firstChild;
+
+        const cancelLink = document.createElement('span');
+        cancelLink.textContent = '[Cancel]';
+        cancelLink.style.cssText = `
+            color: #f50;
+            cursor: pointer;
+            margin-left: 10px;
+            font-size: 12px;
+        `;
+        cancelLink.onclick = () => { batchCancelled = true; };
+        textDiv.appendChild(cancelLink);
+
+        const origSetText = notification.setText;
+        notification.setText = function(msg) {
+            origSetText(msg);
+            textDiv.appendChild(cancelLink);
+        };
+
+        return notification;
+    }
+
+    // ── Download an entire playlist ──
+    async function downloadPlaylist() {
+        hideContextMenu();
+        batchCancelled = false;
+
+        const notification = createBatchNotification('Resolving playlist...');
+
+        try {
+            let clientId = await getClientId();
+            if (!clientId) {
+                notification.remove();
+                alert('Could not find SoundCloud client ID. Please play any track first, then try again.');
+                return;
+            }
+
+            const headers = buildHeaders();
+            const pageUrl = window.location.href.split('?')[0];
+
+            // Resolve playlist
+            const resolveUrl = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(pageUrl)}&client_id=${clientId}`;
+            const resp = await gmFetch(resolveUrl, { headers });
+            const playlist = JSON.parse(resp.responseText);
+
+            if (!playlist.tracks || playlist.tracks.length === 0) {
+                throw new Error('No tracks found in playlist');
+            }
+
+            const totalTracks = playlist.tracks.length;
+
+            // SoundCloud returns partial track objects for large playlists — fetch full data in batches of 50
+            const needsFull = playlist.tracks.some(t => !t.media);
+            let fullTracks = playlist.tracks;
+
+            if (needsFull) {
+                notification.setText('Fetching full track data...');
+                fullTracks = [];
+                const ids = playlist.tracks.map(t => t.id);
+                for (let i = 0; i < ids.length; i += 50) {
+                    const batch = ids.slice(i, i + 50);
+                    const batchUrl = `https://api-v2.soundcloud.com/tracks?ids=${batch.join(',')}&client_id=${clientId}`;
+                    const batchResp = await gmFetch(batchUrl, { headers });
+                    const batchData = JSON.parse(batchResp.responseText);
+                    fullTracks.push(...batchData);
+                }
+            }
+
+            const zipFiles = [];
+            let downloaded = 0;
+
+            for (let i = 0; i < fullTracks.length; i++) {
+                if (batchCancelled) {
+                    break;
+                }
+
+                const track = fullTracks[i];
+                const trackName = track.title || `Track ${i + 1}`;
+                notification.setText(`Downloading playlist: ${i + 1}/${totalTracks} — ${trackName}`);
+                notification.setProgress(Math.round(((i) / totalTracks) * 100));
+
+                try {
+                    const { blob, filename } = await downloadTrackData(track, clientId, notification);
+                    zipFiles.push({ name: filename, data: await blob.arrayBuffer() });
+                    downloaded++;
+                } catch (err) {
+                    console.error(`[SC Extras] Failed to download "${trackName}":`, err);
+                }
+
+                // Delay between tracks to avoid rate limiting
+                if (i < fullTracks.length - 1) {
+                    await new Promise(r => setTimeout(r, 1500));
+                }
+            }
+
+            if (downloaded === 0) {
+                notification.setText('No tracks could be downloaded');
+                setTimeout(() => notification.remove(), 3000);
+                return;
+            }
+
+            notification.setText('Creating ZIP file...');
+            notification.setProgress(95);
+
+            const playlistName = cleanFilename(playlist.title || 'playlist');
+            const zipBlob = buildZip(zipFiles);
+            triggerBlobDownload(zipBlob, playlistName + '.zip');
+
+            const label = batchCancelled ? 'Cancelled' : 'Playlist complete';
+            notification.setText(`${label}: ${downloaded}/${totalTracks} tracks zipped`);
+            notification.setProgress(100);
+            setTimeout(() => notification.remove(), 4000);
+
+        } catch (error) {
+            console.error('[SC Extras] Playlist download error:', error);
+            notification.setText('Playlist download failed');
+            setTimeout(() => notification.remove(), 3000);
+            alert('Failed to download playlist: ' + (error.message || 'Unknown error'));
+        }
+    }
+
+    // ── Download all liked tracks ──
+    async function downloadLikes() {
+        hideContextMenu();
+        batchCancelled = false;
+
+        const notification = createBatchNotification('Fetching likes...');
+
+        try {
+            let clientId = await getClientId();
+            if (!clientId) {
+                notification.remove();
+                alert('Could not find SoundCloud client ID. Please play any track first, then try again.');
+                return;
+            }
+
+            const headers = buildHeaders();
+
+            // Get user ID from hydration or by resolving the page URL
+            let userId = null;
+            try {
+                if (window.__sc_hydration) {
+                    for (const item of window.__sc_hydration) {
+                        if (item?.hydratable === 'user' && item.data?.id) {
+                            userId = item.data.id;
+                            break;
+                        }
+                    }
+                }
+            } catch (_) {}
+
+            if (!userId) {
+                // Resolve the user profile URL (strip /likes)
+                const userUrl = window.location.href.replace(/\/likes\/?$/, '');
+                const resolveUrl = `https://api-v2.soundcloud.com/resolve?url=${encodeURIComponent(userUrl)}&client_id=${clientId}`;
+                const resp = await gmFetch(resolveUrl, { headers });
+                const userData = JSON.parse(resp.responseText);
+                userId = userData.id;
+            }
+
+            if (!userId) throw new Error('Could not determine user ID');
+
+            // Paginate likes
+            notification.setText('Fetching liked tracks...');
+            const allTracks = [];
+            let nextHref = `https://api-v2.soundcloud.com/users/${userId}/likes?client_id=${clientId}&limit=200&offset=0`;
+
+            while (nextHref) {
+                if (batchCancelled) break;
+
+                // Ensure client_id is in the URL
+                if (!nextHref.includes('client_id=')) {
+                    nextHref += (nextHref.includes('?') ? '&' : '?') + `client_id=${clientId}`;
+                }
+
+                const resp = await gmFetch(nextHref, { headers });
+                const data = JSON.parse(resp.responseText);
+
+                if (data.collection) {
+                    for (const item of data.collection) {
+                        if (item.track) {
+                            allTracks.push(item.track);
+                        }
+                    }
+                }
+
+                notification.setText(`Fetching liked tracks... (${allTracks.length} found)`);
+                nextHref = data.next_href || null;
+            }
+
+            if (allTracks.length === 0) {
+                notification.setText('No liked tracks found');
+                setTimeout(() => notification.remove(), 3000);
+                return;
+            }
+
+            const totalTracks = allTracks.length;
+
+            // Fetch full track data for tracks missing media info
+            const incompleteTracks = allTracks.filter(t => !t.media);
+            if (incompleteTracks.length > 0) {
+                notification.setText('Fetching full track data...');
+                const ids = incompleteTracks.map(t => t.id);
+                const fullMap = new Map();
+                for (let i = 0; i < ids.length; i += 50) {
+                    const batch = ids.slice(i, i + 50);
+                    const batchUrl = `https://api-v2.soundcloud.com/tracks?ids=${batch.join(',')}&client_id=${clientId}`;
+                    const batchResp = await gmFetch(batchUrl, { headers });
+                    const batchData = JSON.parse(batchResp.responseText);
+                    for (const t of batchData) {
+                        fullMap.set(t.id, t);
+                    }
+                }
+                for (let i = 0; i < allTracks.length; i++) {
+                    if (!allTracks[i].media && fullMap.has(allTracks[i].id)) {
+                        allTracks[i] = fullMap.get(allTracks[i].id);
+                    }
+                }
+            }
+
+            const zip = new JSZip();
+            let downloaded = 0;
+
+            for (let i = 0; i < allTracks.length; i++) {
+                if (batchCancelled) {
+                    break;
+                }
+
+                const track = allTracks[i];
+                const trackName = track.title || `Track ${i + 1}`;
+                notification.setText(`Downloading likes: ${i + 1}/${totalTracks} — ${trackName}`);
+                notification.setProgress(Math.round(((i) / totalTracks) * 100));
+
+                try {
+                    const { blob, filename } = await downloadTrackData(track, clientId, notification);
+                    zip.file(filename, await blob.arrayBuffer());
+                    downloaded++;
+                } catch (err) {
+                    console.error(`[SC Extras] Failed to download "${trackName}":`, err);
+                }
+
+                if (i < allTracks.length - 1) {
+                    await new Promise(r => setTimeout(r, 1500));
+                }
+            }
+
+            if (downloaded === 0) {
+                notification.setText('No tracks could be downloaded');
+                setTimeout(() => notification.remove(), 3000);
+                return;
+            }
+
+            notification.setText('Creating ZIP file...');
+            notification.setProgress(95);
+
+            // Extract username from the page URL
+            const username = cleanFilename(window.location.pathname.replace(/\/likes\/?$/, '').replace(/^\//, '') || 'likes');
+            const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+            triggerBlobDownload(zipBlob, username + '-likes.zip');
+
+            const label = batchCancelled ? 'Cancelled' : 'Likes complete';
+            notification.setText(`${label}: ${downloaded}/${totalTracks} tracks zipped`);
+            notification.setProgress(100);
+            setTimeout(() => notification.remove(), 4000);
+
+        } catch (error) {
+            console.error('[SC Extras] Likes download error:', error);
+            notification.setText('Likes download failed');
+            setTimeout(() => notification.remove(), 3000);
+            alert('Failed to download likes: ' + (error.message || 'Unknown error'));
         }
     }
 
@@ -771,6 +1134,19 @@
                 if (imageType === 'artwork') {
                     const downloadSongItem = createMenuItem('Save Track', downloadSong);
                     contextMenu.appendChild(downloadSongItem);
+                }
+
+                // Playlist page: offer batch download
+                const currentPath = window.location.pathname;
+                if (currentPath.includes('/sets/')) {
+                    const playlistItem = createMenuItem('Save Playlist', downloadPlaylist);
+                    contextMenu.appendChild(playlistItem);
+                }
+
+                // Likes page: offer batch download
+                if (currentPath.endsWith('/likes')) {
+                    const likesItem = createMenuItem('Save Likes', downloadLikes);
+                    contextMenu.appendChild(likesItem);
                 }
 
                 contextMenu.style.left = e.clientX + 'px';

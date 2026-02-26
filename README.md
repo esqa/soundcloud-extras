@@ -3,7 +3,7 @@
 <div align="center">
   <img src="https://img.shields.io/badge/Tampermonkey-Script-blue?style=for-the-badge&logo=tampermonkey" alt="Tampermonkey">
   <img src="https://img.shields.io/badge/SoundCloud-Extras-orange?style=for-the-badge&logo=soundcloud" alt="SoundCloud">
-  <img src="https://img.shields.io/badge/Version-1.0-green?style=for-the-badge" alt="Version">
+  <img src="https://img.shields.io/badge/Version-2.2-green?style=for-the-badge" alt="Version">
 </div>
 
 <div align="center">
